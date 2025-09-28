@@ -1,14 +1,11 @@
-streamlit>=1.37
+streamlit>=1.50
 pandas>=2.2
-numpy>=1.26
+numpy>=2.0
 plotly>=5.24
 requests>=2.32
 yfinance>=0.2.44
 ta>=0.11.0
 scikit-learn>=1.5
-tensorflow>=2.16; platform_machine == "arm64" and sys_platform == "darwin"
-tensorflow-macos>=2.16; platform_machine == "arm64" and sys_platform == "darwin"
-tensorflow>=2.16; sys_platform != "darwin"
 feedparser>=6.0
 nltk>=3.9
 scipy>=1.13
