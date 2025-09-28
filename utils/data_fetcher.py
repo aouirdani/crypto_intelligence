@@ -11,8 +11,7 @@ BINANCE = "https://api.binance.com"
 def _ts_to_dt(ts): return datetime.fromtimestamp(ts, tz=timezone.utc)
 def _now_utc(): return datetime.now(timezone.utc)
 
-# ------------------------- Public price snapshot (CoinGecko) -------------------------
-
+# ---------- CoinGecko snapshot ----------
 def coingecko_simple_prices(ids=("bitcoin","ethereum","solana"), vs_currencies=("usd","eur")) -> pd.DataFrame:
     ids_param = ",".join(ids)
     vs_param = ",".join(vs_currencies)
@@ -39,8 +38,7 @@ def coingecko_simple_prices(ids=("bitcoin","ethereum","solana"), vs_currencies=(
         rows.append(row)
     return pd.DataFrame(rows)
 
-# ------------------------- OHLCV: Binance primary, YF fallback, synth last resort ----
-
+# ---------- OHLCV with robust fallbacks ----------
 _YF_MAP = {
     "BTCUSDT": "BTC-USD",
     "ETHUSDT": "ETH-USD",
@@ -50,46 +48,42 @@ _YF_MAP = {
 }
 
 def _yf_interval_for(interval: str) -> str:
-    # yfinance support: 1m,2m,5m,15m,30m,60m,90m,1h,1d...
     if interval in ("1h", "4h"): return "1h"
     if interval == "15m": return "15m"
     if interval == "1d": return "1d"
     return "1h"
 
 def _placeholder_klines(symbol="BTCUSDT", interval="1h", limit=500) -> pd.DataFrame:
-    """Série synthétique (dernier recours) pour éviter un crash UI."""
     base_map = {"BTCUSDT": 45000, "ETHUSDT": 2500, "SOLUSDT": 100, "BNBUSDT": 300, "XRPUSDT": 0.6}
     base = float(base_map.get(symbol, 100.0))
-    freq = "H" if interval in ("1h", "4h") else ("15min" if interval == "15m" else "D")
+    freq = "4H" if interval == "4h" else ("15min" if interval == "15m" else ("H" if interval == "1h" else "D"))
     n = int(limit)
     idx = pd.date_range(end=datetime.now(timezone.utc), periods=n, freq=freq)
     rng = np.random.default_rng(42)
-    vol_scale = 0.002 if ("H" in freq or "min" in freq) else 0.01
+    vol_scale = 0.002 if freq in ("H","4H","15min") else 0.01
     rets = rng.normal(0, vol_scale, n)
-    prices = base * (1 + pd.Series(rets)).add(1).cumprod().values
-    high = prices * (1 + rng.uniform(0.0, 0.01, n))
-    low  = prices * (1 - rng.uniform(0.0, 0.01, n))
-    open_ = np.r_[prices[0], prices[:-1]]
+    close = base * (1 + pd.Series(rets, index=idx)).add(1).cumprod().values
+    high = close * (1 + rng.uniform(0.0, 0.01, n))
+    low  = close * (1 - rng.uniform(0.0, 0.01, n))
+    open_ = np.r_[close[0], close[:-1]]
     vol = rng.integers(1e3, 1e5, n)
-    df = pd.DataFrame(
-        {"open_time": idx, "open": open_, "high": high, "low": low, "close": prices, "volume": vol}
-    )
-    return df
+    df = pd.DataFrame({"open_time": idx, "open": open_, "high": high, "low": low, "close": close, "volume": vol})
+    return df[["open_time","open","high","low","close","volume"]]
 
 def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["open","high","low","close","volume"])
-    ohlcv = (
-        df.resample(rule)
-          .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
-          .dropna(how="any")
-    )
-    return ohlcv
+    o = df["open"].resample(rule).first()
+    h = df["high"].resample(rule).max()
+    l = df["low"].resample(rule).min()
+    c = df["close"].resample(rule).last()
+    v = df["volume"].resample(rule).sum()
+    out = pd.concat([o.rename("open"), h.rename("high"), l.rename("low"), c.rename("close"), v.rename("volume")], axis=1)
+    return out.dropna(how="any")
 
 def _yf_klines(symbol="BTCUSDT", interval="1h", limit=500) -> pd.DataFrame:
     ticker = _YF_MAP.get(symbol, "BTC-USD")
     yf_int = _yf_interval_for(interval)
-    # période suffisante pour couvrir le nombre de barres demandé
     period = "7d" if yf_int=="15m" else ("60d" if yf_int=="1h" else "2y")
 
     df = yf.download(ticker, period=period, interval=yf_int, progress=False, auto_adjust=False)
@@ -98,6 +92,8 @@ def _yf_klines(symbol="BTCUSDT", interval="1h", limit=500) -> pd.DataFrame:
 
     df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
     df.index = pd.to_datetime(df.index, utc=True)
+    if {"open","high","low","close","volume"} - set(df.columns):
+        return _placeholder_klines(symbol, interval, limit)
 
     if interval == "4h":
         df = _resample_ohlcv(df, "4H")
@@ -105,14 +101,12 @@ def _yf_klines(symbol="BTCUSDT", interval="1h", limit=500) -> pd.DataFrame:
             return _placeholder_klines(symbol, interval, limit)
 
     df = df[["open","high","low","close","volume"]].copy()
-    df = df.reset_index(names="open_time")
-    return df[["open_time","open","high","low","close","volume"]].tail(limit)
+    df.index.name = "open_time"
+    df = df.reset_index()
+    return df.tail(limit)[["open_time","open","high","low","close","volume"]]
 
 def binance_klines(symbol="BTCUSDT", interval="1h", limit=500) -> pd.DataFrame:
-    """
-    Essaie Binance ; en cas de 4xx/5xx/payload vide → fallback YF ; si YF vide → synth.
-    Toujours retourne un DataFrame avec colonnes: open_time, open, high, low, close, volume
-    """
+    """Try Binance; on error/empty → yfinance; if still empty → synthetic series."""
     url = f"{BINANCE}/api/v3/klines"
     try:
         r = requests.get(
@@ -144,8 +138,7 @@ def binance_klines(symbol="BTCUSDT", interval="1h", limit=500) -> pd.DataFrame:
         except Exception:
             return _placeholder_klines(symbol=symbol, interval=interval, limit=limit)
 
-# ------------------------- News / Reddit ---------------------------------------------
-
+# ---------- News / Reddit ----------
 def news_from_rss(feeds=None, max_items=50) -> pd.DataFrame:
     import feedparser
     if feeds is None:
